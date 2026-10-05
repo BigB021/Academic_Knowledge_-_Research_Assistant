@@ -1,0 +1,27 @@
+[project]
+name = "academic-research-assistant"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { email = "youssefaitbouddroub@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "bert-score>=0.3.13",
+    "matplotlib>=3.11.2",
+    "ollama>=0.6.3",
+    "pandas>=3.0.6",
+    "pymupdf>=1.28.2",
+    "requests>=2.34.2",
+    "rouge-score>=0.1.2",
+    "sacrebleu>=2.6.0",
+    "tqdm>=4.70.1",
+]
+
+[project.scripts]
+academic-research-assistant = "academic_research_assistant:main"
+
+[build-system]
+requires = ["uv_build>=0.12.23,<0.13.0"]
+build-backend = "uv_build"
