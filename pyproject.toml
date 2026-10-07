@@ -9,13 +9,17 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "bert-score>=0.3.13",
+    "langchain>=1.4.3",
+    "langdetect>=1.0.9",
     "matplotlib>=3.11.2",
     "ollama>=0.6.3",
     "pandas>=3.0.6",
     "pymupdf>=1.28.2",
+    "pytesseract>=0.3.13",
     "requests>=2.34.2",
     "rouge-score>=0.1.2",
     "sacrebleu>=2.6.0",
+    "spacy>=3.8.16",
     "tqdm>=4.70.1",
 ]
 
