@@ -70,7 +70,8 @@ class PageContent:
     metadata: Dict
 
 
-class PDFProcessor:
+
+class PDF2TextProcessor:
     """Robust PDF text extraction and preprocessing for RAG systems."""
     
     def __init__(self, 
@@ -377,7 +378,7 @@ def open_read_pdf(pdf_path: str, enable_ocr: bool = True) -> List[PageContent]:
     Returns:
         List of PageContent objects
     """
-    processor = PDFProcessor(enable_ocr=enable_ocr)
+    processor = PDF2TextProcessor(enable_ocr=enable_ocr)
     pages, _ = processor.process_pdf(pdf_path)
     return pages
 
@@ -418,7 +419,7 @@ if __name__ == "__main__":
         print("Creating synthetic test example instead...\n")
         
         # Create a synthetic test
-        processor = PDFProcessor(enable_ocr=False)
+        processor = PDF2TextProcessor(enable_ocr=False)
         
         # Test the processor initialization
         print(f"[+] Processor initialized successfully")
@@ -446,7 +447,7 @@ if __name__ == "__main__":
     print("=" * 80)
     
     # Initialize processor
-    processor = PDFProcessor(enable_ocr=True, clean_text=True)
+    processor = PDF2TextProcessor(enable_ocr=True, clean_text=True)
     
     # Process PDF
     print("\n[-] Extracting content...")
