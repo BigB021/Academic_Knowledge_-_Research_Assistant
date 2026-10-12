@@ -411,7 +411,7 @@ if __name__ == "__main__":
     print("=" * 80)
     
     # Test configuration
-    pdf_dir = os.path.join(os.path.dirname(__file__), "..", "Datasets", "pdfs")
+    pdf_dir = os.path.join(os.path.dirname(__file__), "..", "documents", "pdfs")
     
     # Check if test directory exists
     if not os.path.exists(pdf_dir):
@@ -431,7 +431,7 @@ if __name__ == "__main__":
         print("\n" + "=" * 80)
         print("Example: Processing a real PDF")
         print("=" * 80)
-        print("To test with a real PDF, place your PDFs in: Datasets/pdfs/")
+        print("To test with a real PDF, place your PDFs in: documents/pdfs/")
         print("Then run this script again.")
         sys.exit(0)
     

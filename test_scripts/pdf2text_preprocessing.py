@@ -7,7 +7,7 @@ import random
 from spacy.lang.en import English
 import pandas as pd
 
-pdf_dir = os.path.join(os.path.dirname(__file__), "..", "Datasets", "pdfs")
+pdf_dir = os.path.join(os.path.dirname(__file__), "..", "documents", "pdfs")
 
 def text_formatter(text: str):
     cleaned_text = text.replace("\n", " ").replace("\t", " ")

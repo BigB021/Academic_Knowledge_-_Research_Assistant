@@ -313,7 +313,7 @@ def main() -> int:
     """Sample test: convert the sample PDF into per-page chunks."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-    pdf_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Datasets", "pdfs")
+    pdf_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "documents", "pdfs")
     pdf_path = os.path.join(pdf_dir, "2410.01574v4.pdf")
     output_path = os.path.join(pdf_dir, "result.md")
 

@@ -4,7 +4,8 @@ import pymupdf4llm
 import os
 
 
-pdf_dir = os.path.join(os.path.dirname(__file__), "..", "Datasets", "pdfs")
+
+pdf_dir = os.path.join(os.path.dirname(__file__), "..", "documents", "pdfs")
 pdf_path = os.path.join(pdf_dir, "2410.01574v4.pdf")
 
 md = pymupdf4llm.to_markdown(pdf_path)
