@@ -204,6 +204,29 @@ class PDF2MarkdownProcessor:
         log.info("Batch done: %d converted, %d failed", len(report.converted), len(report.failed))
         return report
 
+    def get_document_statistics(self, pdf_path: Path) -> dict[str, int]:
+        """Return statistics about the PDF document.
+
+        Args:
+            pdf_path: Path to the input PDF.
+
+        Returns:
+            A dictionary with keys like 'page_count', 'image_count', etc.
+        """
+        self._check_pdf_readable(pdf_path)
+        with pymupdf.open(pdf_path) as doc:
+            stats = {
+                "page_count": doc.page_count,
+                "image_count": sum(len(page.get_images(full=True)) for page in doc),
+                "character_count": sum(len(page.get_text("text")) for page in doc),
+                "word_count": sum(len(page.get_text("text").split()) for page in doc),
+                "sentence_count": sum(len(page.get_text("text").split('.')) for page in doc),
+                "paragraph_count": sum(len(page.get_text("text").split('\n\n')) for page in doc),
+                "token_count": sum(len(page.get_text("text").split())*0.25 for page in doc),
+            }
+        return stats
+
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
