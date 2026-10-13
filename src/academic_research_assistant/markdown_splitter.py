@@ -89,7 +89,8 @@ def _pack(pieces, tokenizer, limit):
     return chunks
 
 
-def split_markdown_by_headings_with_token_limit(markdown_text, tokenizer, token_limit=500):
+
+def split_markdown_by_headings_with_token_limit(markdown_text, tokenizer, token_limit=512):
     """Split markdown into chunks of at most `token_limit` tokens.
 
     Sections start at every markdown heading (# to ######). Sections that fit
@@ -113,8 +114,10 @@ def split_markdown_by_headings_with_token_limit(markdown_text, tokenizer, token_
 
 def token_length_function(text: str) -> int:
     return len(tokenizer.encode(text, add_special_tokens=False))
-# Checks------------------------------------------------------------------
 
+
+
+# Checks------------------------------------------------------------------
 def check_chunks(chunks, tokenizer, token_limit):
     """Print each chunk's size and assert none exceeds the limit."""
     for i, chunk in enumerate(chunks, start=1):
@@ -139,7 +142,7 @@ if __name__ == "__main__":
         token=HF_TOKEN
     )
 
-    token_limit = 100
+    token_limit = 512
 
     pdf_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "documents", "pdfs")
     pdf_path = os.path.join(pdf_dir, "2410.01574v4.pdf")
