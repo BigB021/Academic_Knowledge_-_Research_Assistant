@@ -11,13 +11,42 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.PDF2MarkdownProcessor import PDF2MarkdownProcessor
-
 HEADING_START = re.compile(r"(?m)^(?=#{1,6}\s)")  # zero-width: keeps the '#' markers
 HEADING_ONLY = re.compile(r"#{1,6}\s[^\n]*")
 PARAGRAPH_SPLIT = re.compile(r"\n\s*\n")
+TABLE_SPLIT = re.compile(r"\n\s*\|")  # for tables, split on newlines that start with a pipe    
 SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 SEPARATOR = "\n\n"
+
+
+class FastTokenizer:
+    """Thin wrapper over a `tokenizers.Tokenizer` with the slice of the
+    transformers API the splitter uses (encode / decode).
+
+    Loading through `tokenizers` directly avoids importing transformers and
+    torch, which is ~45s faster and ~300MB lighter than AutoTokenizer.
+    """
+
+    def __init__(self, tokenizer):
+        self._tokenizer = tokenizer
+
+    def encode(self, text, add_special_tokens=True):
+        return self._tokenizer.encode(text, add_special_tokens=add_special_tokens).ids
+
+    def decode(self, ids):
+        return self._tokenizer.decode(ids, skip_special_tokens=False)
+
+
+def load_tokenizer(name, token=None):
+    """Load a Hugging Face tokenizer, preferring the local cache over the network."""
+    from huggingface_hub import hf_hub_download
+    from tokenizers import Tokenizer
+
+    try:
+        path = hf_hub_download(name, "tokenizer.json", local_files_only=True)
+    except Exception:  # not cached yet: download once
+        path = hf_hub_download(name, "tokenizer.json", token=token)
+    return FastTokenizer(Tokenizer.from_file(path))
 
 
 def _count(text, tokenizer):
@@ -112,10 +141,6 @@ def split_markdown_by_headings_with_token_limit(markdown_text, tokenizer, token_
     pieces = _glue_orphan_headings(pieces, tokenizer, token_limit)
     return _pack(pieces, tokenizer, token_limit)
 
-def token_length_function(text: str) -> int:
-    return len(tokenizer.encode(text, add_special_tokens=False))
-
-
 
 # Checks------------------------------------------------------------------
 def check_chunks(chunks, tokenizer, token_limit):
@@ -129,18 +154,16 @@ def check_chunks(chunks, tokenizer, token_limit):
 
 
 if __name__ == "__main__":
-    from transformers import AutoTokenizer
     from dotenv import load_dotenv
     import os
+
+    from utils.PDF2MarkdownProcessor import PDF2MarkdownProcessor
 
     load_dotenv()
 
     HF_TOKEN = os.getenv("HG_ACCESS_TOKEN")
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        "google/gemma-3-4b-it",
-        token=HF_TOKEN
-    )
+    tokenizer = load_tokenizer("google/gemma-3-4b-it", token=HF_TOKEN)
 
     token_limit = 512
 

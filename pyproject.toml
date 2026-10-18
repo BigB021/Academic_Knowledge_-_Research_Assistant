@@ -27,6 +27,7 @@ dependencies = [
     "requests>=2.34.2",
     "rouge-score>=0.1.2",
     "sacrebleu>=2.6.0",
+    "sentence-transformers>=6.1.0",
     "spacy>=3.8.16",
     "tiktoken>=0.14.0",
     "tqdm>=4.70.1",

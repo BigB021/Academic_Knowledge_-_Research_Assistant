@@ -32,12 +32,11 @@ from typing import Optional, Sequence
 import ollama
 import pymupdf
 from dotenv import load_dotenv
-from transformers import AutoTokenizer
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 from utils.PDF2MarkdownProcessor import PDF2MarkdownProcessor  
-from .markdown_splitter import split_markdown_by_headings_with_token_limit  
+from markdown_splitter import load_tokenizer as _load_tokenizer, split_markdown_by_headings_with_token_limit  
 
 load_dotenv()
 log = logging.getLogger("embed_documents")
@@ -47,6 +46,10 @@ TOKENIZER_NAME = os.getenv("TOKENIZER_NAME", "google/gemma-3-4b-it")
 TOKEN_LIMIT = int(os.getenv("TOKEN_LIMIT", "512"))
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "16"))
 MAX_RETRIES = int(os.getenv("EMBED_MAX_RETRIES", "3"))
+# Chunks are capped at TOKEN_LIMIT, so the default 4096 context only wastes KV-cache RAM.
+# 2x headroom covers tokenizer differences between Gemma (splitter) and Qwen (embedder).
+# Use the same value as retrieval.py: a different num_ctx makes Ollama reload the model.
+EMBED_OPTIONS = {"num_ctx": int(os.getenv("EMBED_NUM_CTX", str(2 * TOKEN_LIMIT)))}
 
 
 @dataclass(frozen=True)
@@ -63,7 +66,7 @@ class ChunkRecord:
 # ---------------------------------------------------------------------------
 
 def load_tokenizer():
-    return AutoTokenizer.from_pretrained(TOKENIZER_NAME, token=os.getenv("HG_ACCESS_TOKEN"))
+    return _load_tokenizer(TOKENIZER_NAME, token=os.getenv("HG_ACCESS_TOKEN"))
 
 
 def ensure_embedding_model(model: str) -> None:
@@ -97,7 +100,7 @@ def embed_batch(texts: Sequence[str]) -> list[list[float]]:
     """Embed a batch of texts, retrying transient Ollama failures."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = ollama.embed(model=EMBED_MODEL, input=list(texts))
+            response = ollama.embed(model=EMBED_MODEL, input=list(texts), options=EMBED_OPTIONS)
             embeddings = response["embeddings"]
             if len(embeddings) != len(texts):
                 raise RuntimeError(
@@ -223,6 +226,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         except Exception:
             failures += 1
             log.exception("Failed to embed %s", pdf)
+
+    # Ingestion is a batch job: free the embedder's RAM now instead of after Ollama's idle timeout.
+    with contextlib.suppress(ollama.ResponseError, ConnectionError):
+        ollama.generate(model=EMBED_MODEL, keep_alive=0)
 
     log.info("Finished: %d document(s), %d failed", len(pdfs), failures)
     return 1 if failures else 0
