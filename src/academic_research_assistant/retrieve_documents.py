@@ -101,6 +101,12 @@ class RetrievedChunk:
     distance: Optional[float]               # vector distance (lower is closer)
     rerank_score: Optional[float] = None    # P(yes) from the reranker (higher is better)
 
+    @property
+    def similarity(self) -> Optional[float]:
+        """Cosine similarity in [-1, 1]. The collection uses Chroma's default squared-L2
+        space and the embedder returns unit vectors, so ||a - b||^2 = 2 - 2 cos(a, b)."""
+        return None if self.distance is None else 1.0 - self.distance / 2.0
+
 
 @dataclass(frozen=True)
 class RetrievalResult:
@@ -113,6 +119,16 @@ class RetrievalResult:
     @property
     def chunk_indices(self) -> list[int]:
         return [item.chunk.chunk_index for item in self.chunks]
+
+    @property
+    def chunk_keys(self) -> list[tuple[str, int]]:
+        """(source, chunk_index) pairs: chunk indices alone collide across documents."""
+        return [(item.chunk.source, item.chunk.chunk_index) for item in self.chunks]
+
+    @property
+    def top_similarity(self) -> float:
+        """Similarity of the closest chunk; -1.0 when nothing was retrieved."""
+        return max((item.similarity for item in self.chunks if item.similarity is not None), default=-1.0)
 
 
 class Retriever(Protocol):
@@ -307,6 +323,7 @@ RERANK_SYSTEM = (
 # Might not even consider it (Very slow on CPU inference)
 class Reranker:
     """Scores (query, document) pairs with Qwen3-Reranker via Hugging Face transformers.
+    Only recommended for GPU inference with mid to high-end GPUs.
 
     The model answers "yes" or "no"; the relevance score is P(yes) from a softmax
     over the "yes" and "no" logits at the last position. Documents are scored in
@@ -454,16 +471,29 @@ class RerankedBaselineRetriever:
 @dataclass(frozen=True)
 class TestCase:
     question: str
-    gold: frozenset[int]  # gold chunk indices; assumes a single source document
+    gold: frozenset[int]             # gold chunk indices; empty when the corpus cannot answer
     qtype: str = "lookup"
+    source: Optional[str] = None     # document holding the gold chunks; None matches any source
+    answer: Optional[str] = None     # reference answer, used to judge generated answers
+
+    @property
+    def answerable(self) -> bool:
+        return bool(self.gold)
+
+    def is_gold(self, key: tuple[str, int]) -> bool:
+        source, index = key
+        return index in self.gold and (self.source is None or source == self.source)
 
 
-def score_retrieval(retrieved: Sequence[int], gold: frozenset[int]) -> dict[str, float]:
-    first_hit = next((rank for rank, idx in enumerate(retrieved) if idx in gold), None)
+def score_retrieval(retrieved: Sequence[tuple[str, int]], case: TestCase, k: int = 5) -> dict[str, float]:
+    """Hit@1, Hit@k, Recall@k and MRR for one answerable case (retrieved is in rank order)."""
+    retrieved = list(retrieved)[:k]
+    hits = [case.is_gold(key) for key in retrieved]
+    first_hit = next((rank for rank, hit in enumerate(hits) if hit), None)
     return {
-        "hit@1": float(bool(retrieved) and retrieved[0] in gold),
-        "hit@5": float(first_hit is not None),
-        "recall@5": len(gold & set(retrieved)) / len(gold),
+        "hit@1": float(bool(hits) and hits[0]),
+        f"hit@{k}": float(first_hit is not None),
+        f"recall@{k}": len({key[1] for key, hit in zip(retrieved, hits) if hit}) / len(case.gold),
         "mrr": 0.0 if first_hit is None else 1.0 / (first_hit + 1),
     }
 
@@ -471,6 +501,8 @@ def score_retrieval(retrieved: Sequence[int], gold: frozenset[int]) -> dict[str,
 def evaluate(retriever: Retriever, cases: Sequence[TestCase], k: int = 5) -> list[dict]:
     rows = []
     for case in cases:
+        if not case.answerable:
+            continue  # no gold chunks to score against
         result = retriever.retrieve(case.question, k=k)
         rows.append({
             "strategy": retriever.name,
@@ -479,7 +511,7 @@ def evaluate(retriever: Retriever, cases: Sequence[TestCase], k: int = 5) -> lis
             "gold": sorted(case.gold),
             "retrieved": result.chunk_indices,
             "latency_s": result.latency_s,
-            **score_retrieval(result.chunk_indices, case.gold),
+            **score_retrieval(result.chunk_keys, case, k),
         })
     return rows
 
@@ -487,7 +519,13 @@ def evaluate(retriever: Retriever, cases: Sequence[TestCase], k: int = 5) -> lis
 def load_cases(path: Path) -> list[TestCase]:
     raw = json.loads(path.read_text(encoding="utf-8"))
     return [
-        TestCase(question=item["question"], gold=frozenset(item["gold"]), qtype=item.get("type", "lookup"))
+        TestCase(
+            question=item["question"],
+            gold=frozenset(item.get("gold", [])),
+            qtype=item.get("type", "lookup"),
+            source=item.get("source"),
+            answer=item.get("answer"),
+        )
         for item in raw
     ]
 
@@ -502,26 +540,26 @@ def _print_result(result: RetrievalResult) -> None:
     for rank, item in enumerate(result.chunks, start=1):
         scores = []
         if item.distance is not None:
-            scores.append(f"distance={item.distance:.4f}")
+            scores.append(f"similarity={item.similarity:.4f}")
         if item.rerank_score is not None:
             scores.append(f"rerank={item.rerank_score:.4f}")
         print(f"#{rank} chunk {item.chunk.chunk_index} ({', '.join(scores)})")
         print(f"   {item.chunk.text[:150]!r}")
 
 
-def _print_eval(rows: list[dict]) -> None:
+def _print_eval(rows: list[dict], k: int = 5) -> None:
     import statistics
 
     by_strategy: dict[str, list[dict]] = {}
     for row in rows:
         by_strategy.setdefault(row["strategy"], []).append(row)
-    print(f"\n{'strategy':<20}{'hit@1':>8}{'hit@5':>8}{'recall@5':>10}{'mrr':>8}{'latency':>10}")
+    print(f"\n{'strategy':<20}{'hit@1':>8}{f'hit@{k}':>8}{f'recall@{k}':>10}{'mrr':>8}{'latency':>10}")
     for name, group in by_strategy.items():
         print(
             f"{name:<20}"
             f"{statistics.mean(r['hit@1'] for r in group):>8.3f}"
-            f"{statistics.mean(r['hit@5'] for r in group):>8.3f}"
-            f"{statistics.mean(r['recall@5'] for r in group):>10.3f}"
+            f"{statistics.mean(r[f'hit@{k}'] for r in group):>8.3f}"
+            f"{statistics.mean(r[f'recall@{k}'] for r in group):>10.3f}"
             f"{statistics.mean(r['mrr'] for r in group):>8.3f}"
             f"{statistics.mean(r['latency_s'] for r in group):>9.2f}s"
         )
@@ -569,7 +607,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         unload_models(*(model for model in strategy.models if model not in still_needed))
 
     if rows:
-        _print_eval(rows)
+        _print_eval(rows, args.k)
     return 0
 
 

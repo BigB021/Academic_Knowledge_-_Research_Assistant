@@ -1,0 +1,27 @@
+{
+  "threshold": 0.5617,
+  "reject_below": 0.315,
+  "accept_at": 0.5806,
+  "rerank_min": 0.5286,
+  "calibration": {
+    "n_answerable": 27,
+    "n_out_of_corpus": 14,
+    "threshold_balanced_accuracy": 0.9444,
+    "rerank_balanced_accuracy": 1.0,
+    "margin": 0.02,
+    "answerable_similarity": {
+      "min": 0.335,
+      "median": 0.719,
+      "max": 0.8558
+    },
+    "out_of_corpus_similarity": {
+      "min": 0.1435,
+      "median": 0.5074,
+      "max": 0.5606
+    },
+    "rerank_fit_on": "borderline",
+    "k": 5,
+    "cases": "rag_eval_set.json",
+    "reranker": true
+  }
+}
