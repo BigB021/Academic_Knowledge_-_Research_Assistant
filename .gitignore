@@ -1,15 +1,37 @@
 # Python-generated files
 __pycache__/
 *.py[oc]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 build/
 dist/
 wheels/
 *.egg-info
 
 # Virtual environments
-.venv
+.venv/
 
+# Environment files
 .env
+.env.*
+!.env.example
 
-datasets/
+# Logs
 logs/
+*.log
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Operating system and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Documents
+documents/
+test_scripts/
+vector_store/
