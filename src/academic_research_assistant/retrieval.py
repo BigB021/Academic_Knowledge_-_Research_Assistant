@@ -62,16 +62,24 @@ MAX_CANDIDATES = 20
 # one in embed_documents.py): a request with a different num_ctx forces a model reload.
 #   embedder  chunks are <= 512 Gemma tokens          -> 1024 (2x tokenizer headroom)
 #   rewriter  ~100-token prompt + a short JSON answer -> 512
-EMBED_OPTIONS = {"num_ctx": int(os.getenv("EMBED_NUM_CTX", "1024"))}
+# Ollama picks GPU or CPU on its own (CUDA, ROCm or Metal when available). OLLAMA_NUM_GPU
+# overrides how many layers it offloads to the GPU: 0 forces CPU, 999 offloads everything.
+# Unset leaves Ollama's automatic choice.
+GPU_OPTIONS = {"num_gpu": int(os.environ["OLLAMA_NUM_GPU"])} if os.getenv("OLLAMA_NUM_GPU") else {}
+EMBED_OPTIONS = {"num_ctx": int(os.getenv("EMBED_NUM_CTX", "1024")), **GPU_OPTIONS}
 LLM_OPTIONS = {
     "temperature": 0.3,
     "seed": 67,  # fixed seed so results are reproducible
     "num_ctx": int(os.getenv("REWRITE_NUM_CTX", "512")),
     "num_predict": 128,  # a search query never needs more; stops runaway generations
+    **GPU_OPTIONS,
 }
 # Reranker input: ~90-token instruction + query + a chunk of <= 512 Gemma tokens.
 RERANK_MAX_LENGTH = int(os.getenv("RERANK_MAX_LENGTH", "1024"))
-RERANK_BATCH_SIZE = int(os.getenv("RERANK_BATCH_SIZE", "4"))
+# "auto" picks cuda, then mps (Apple silicon), then cpu; or name one, e.g. "cuda:1".
+RERANK_DEVICE = os.getenv("RERANK_DEVICE", "auto")
+# Unset: 16 on a GPU, 4 on CPU (larger CPU batches only add padding work).
+RERANK_BATCH_SIZE = int(os.environ["RERANK_BATCH_SIZE"]) if os.getenv("RERANK_BATCH_SIZE") else None
 
 T = TypeVar("T")
 
@@ -304,15 +312,19 @@ class Reranker:
     over the "yes" and "no" logits at the last position. Documents are scored in
     batches, in-process, so no Ollama runner is involved.
 
-    The model (~2.4 GB in float32) is loaded on first use and freed by close().
+    Runs on a GPU in half precision when one is available (CUDA or Apple MPS),
+    otherwise on CPU in float32. The model (~1.2 GB in half precision, ~2.4 GB in
+    float32) is loaded on first use and freed by close().
     """
 
     def __init__(self, model: str = RERANK_MODEL, instruction: str = RERANK_INSTRUCTION,
-                 max_length: int = RERANK_MAX_LENGTH, batch_size: int = RERANK_BATCH_SIZE):
+                 max_length: int = RERANK_MAX_LENGTH, batch_size: Optional[int] = RERANK_BATCH_SIZE,
+                 device: str = RERANK_DEVICE):
         self.model_name = model
         self.instruction = instruction
         self.max_length = max_length
         self.batch_size = batch_size
+        self.device = device
         self._model = None
         self._tokenizer = None
         # Reranking is the slowest step on CPU; repeated eval runs in the same
@@ -326,13 +338,30 @@ class Reranker:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        if self.device == "auto":
+            if torch.cuda.is_available():
+                self.device = "cuda"
+            elif torch.backends.mps.is_available():
+                self.device = "mps"
+            else:
+                self.device = "cpu"
+        kind = torch.device(self.device).type
+        if kind == "cuda":
+            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        elif kind == "mps":
+            dtype = torch.float16
+        else:
+            dtype = torch.float32  # half precision is slower than float32 on most CPUs
+        if self.batch_size is None:
+            self.batch_size = 4 if kind == "cpu" else 16
+
         token = os.getenv("HG_ACCESS_TOKEN")
         start = time.perf_counter()
         # Left padding keeps every sequence's last token at position -1.
         self._tokenizer = AutoTokenizer.from_pretrained(self.model_name, padding_side="left", token=token)
         self._model = AutoModelForCausalLM.from_pretrained(
-            self.model_name, dtype=torch.float32, token=token
-        ).eval()
+            self.model_name, dtype=dtype, token=token
+        ).to(self.device).eval()
         self._yes_id = self._tokenizer.convert_tokens_to_ids("yes")
         self._no_id = self._tokenizer.convert_tokens_to_ids("no")
         self._prefix_ids = self._tokenizer.encode(
@@ -341,13 +370,22 @@ class Reranker:
         self._suffix_ids = self._tokenizer.encode(
             "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", add_special_tokens=False
         )
-        log.info("Loaded reranker %s in %.1fs", self.model_name, time.perf_counter() - start)
+        log.info("Loaded reranker %s on %s (%s, batch %d) in %.1fs", self.model_name, self.device,
+                 str(dtype).removeprefix("torch."), self.batch_size, time.perf_counter() - start)
 
     def close(self) -> None:
         """Free the model's memory; it is reloaded on the next score() call."""
+        if self._model is None:
+            return
         self._model = self._tokenizer = None
         import gc
+
+        import torch
         gc.collect()
+        if torch.device(self.device).type == "cuda":
+            torch.cuda.empty_cache()
+        elif torch.device(self.device).type == "mps":
+            torch.mps.empty_cache()
 
     def _score_batch(self, query: str, documents: Sequence[str]) -> list[float]:
         import torch
@@ -357,11 +395,11 @@ class Reranker:
         encoded = self._tokenizer(pairs, padding=False, truncation="longest_first",
                                   return_attention_mask=False, max_length=budget)
         encoded["input_ids"] = [self._prefix_ids + ids + self._suffix_ids for ids in encoded["input_ids"]]
-        inputs = self._tokenizer.pad(encoded, padding=True, return_tensors="pt")
+        inputs = self._tokenizer.pad(encoded, padding=True, return_tensors="pt").to(self.device)
         with torch.inference_mode():
             logits = self._model(**inputs).logits[:, -1, :]
         yes_no = torch.stack([logits[:, self._no_id], logits[:, self._yes_id]], dim=1)
-        return torch.softmax(yes_no.float(), dim=1)[:, 1].tolist()
+        return torch.softmax(yes_no.float(), dim=1)[:, 1].cpu().tolist()
 
     def score(self, query: str, documents: Sequence[str]) -> list[float]:
         missing = list(dict.fromkeys(doc for doc in documents if (query, doc) not in self._scores))

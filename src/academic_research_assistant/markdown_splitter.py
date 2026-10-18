@@ -163,9 +163,9 @@ if __name__ == "__main__":
 
     HF_TOKEN = os.getenv("HG_ACCESS_TOKEN")
 
-    tokenizer = load_tokenizer("google/gemma-3-4b-it", token=HF_TOKEN)
+    tokenizer = load_tokenizer(os.getenv("TOKENIZER_NAME", "google/gemma-3-4b-it"), token=HF_TOKEN)
 
-    token_limit = 512
+    token_limit = int(os.getenv("TOKEN_LIMIT", "512"))
 
     pdf_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "documents", "pdfs")
     pdf_path = os.path.join(pdf_dir, "2410.01574v4.pdf")

@@ -49,7 +49,10 @@ MAX_RETRIES = int(os.getenv("EMBED_MAX_RETRIES", "3"))
 # Chunks are capped at TOKEN_LIMIT, so the default 4096 context only wastes KV-cache RAM.
 # 2x headroom covers tokenizer differences between Gemma (splitter) and Qwen (embedder).
 # Use the same value as retrieval.py: a different num_ctx makes Ollama reload the model.
-EMBED_OPTIONS = {"num_ctx": int(os.getenv("EMBED_NUM_CTX", str(2 * TOKEN_LIMIT)))}
+# Ollama picks GPU or CPU on its own; OLLAMA_NUM_GPU (layers to offload, 0 = CPU only)
+# overrides it. Keep it equal to retrieval.py's, for the same reload reason as num_ctx.
+GPU_OPTIONS = {"num_gpu": int(os.environ["OLLAMA_NUM_GPU"])} if os.getenv("OLLAMA_NUM_GPU") else {}
+EMBED_OPTIONS = {"num_ctx": int(os.getenv("EMBED_NUM_CTX", str(2 * TOKEN_LIMIT))), **GPU_OPTIONS}
 
 
 @dataclass(frozen=True)
