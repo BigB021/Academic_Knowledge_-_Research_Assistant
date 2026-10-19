@@ -1161,6 +1161,32 @@ It also gives you a coherent learning path rather than five disconnected project
 
 # 31. Recommended development progression
 
+## Current implementation status
+
+The current codebase has completed the core local RAG reliability loop:
+
+* PDF-to-Markdown conversion
+* heading- and token-aware chunking
+* local embeddings and Chroma vector storage
+* dense retrieval and optional reranking
+* retrieval evaluation with Recall@k, Hit@1 and MRR
+* calibrated answer gating and abstention
+* page/section metadata propagation
+* internal citation-ID resolution into document, page, section and passage metadata
+
+The project is **not finished** relative to the full roadmap. The next major
+capabilities are:
+
+* citation correctness and citation coverage evaluation
+* BM25 or hybrid dense+sparse retrieval
+* a user interface with PDF page navigation and passage inspection
+* research mode and multi-document synthesis
+* security testing, observability and deployment
+
+Independent module tests are in [`tests/`](tests/README.md). The local-LLM
+inference test requires Ollama; the remaining tests use deterministic fixtures
+and do not call an external model.
+
 The project should evolve roughly like this:
 
 ```text

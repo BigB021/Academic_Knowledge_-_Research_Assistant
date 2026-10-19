@@ -37,7 +37,10 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 from utils.PDF2MarkdownProcessor import PDF2MarkdownProcessor  
-from markdown_splitter import load_tokenizer as _load_tokenizer, split_markdown_by_headings_with_token_limit  
+from academic_research_assistant.markdown_splitter import (
+    load_tokenizer as _load_tokenizer,
+    split_markdown_by_headings_with_token_limit,
+)
 
 load_dotenv()
 log = logging.getLogger("embed_documents")
