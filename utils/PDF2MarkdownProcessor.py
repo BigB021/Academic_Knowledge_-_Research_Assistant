@@ -27,6 +27,7 @@ import argparse
 import contextlib
 import logging
 import os
+import re
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -160,6 +161,13 @@ class PDF2MarkdownProcessor:
         except Exception as exc:  # pymupdf raises a variety of exception types
             raise PDFConversionError(f"Conversion failed for {src}: {exc}") from exc
 
+        if page_chunks:
+            if not isinstance(result, list):
+                raise PDFConversionError(
+                    f"Expected per-page Markdown chunks from {src}, got {type(result).__name__}"
+                )
+            result = self._add_page_metadata(result)
+
         if dst is not None:
             text = self._join_chunks(result) if page_chunks else result
             self._atomic_write(dst, text)
@@ -261,6 +269,35 @@ class PDF2MarkdownProcessor:
     @staticmethod
     def _join_chunks(chunks: list[dict[str, Any]]) -> str:
         return "\n\n".join(chunk["text"] for chunk in chunks)
+
+    @staticmethod
+    def _add_page_metadata(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Add stable, human-readable page and heading metadata to page chunks."""
+        heading_pattern = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
+        enriched: list[dict[str, Any]] = []
+        current_heading: Optional[str] = None
+
+        for page_number, chunk in enumerate(chunks, start=1):
+            if not isinstance(chunk, dict) or "text" not in chunk:
+                raise PDFConversionError(
+                    f"Invalid page chunk at index {page_number - 1}: expected a dict with 'text'"
+                )
+
+            text = str(chunk["text"])
+            headings = [
+                match.group(2).strip()
+                for line in text.splitlines()
+                if (match := heading_pattern.match(line))
+            ]
+            if headings:
+                current_heading = headings[-1]
+
+            enriched_chunk = dict(chunk)
+            enriched_chunk["page"] = page_number
+            enriched_chunk["heading"] = current_heading
+            enriched.append(enriched_chunk)
+
+        return enriched
 
     def _atomic_write(self, path: Path, text: str) -> None:
         """Write via a temp file and rename, so readers never see a partial file."""

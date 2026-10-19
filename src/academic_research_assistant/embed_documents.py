@@ -12,7 +12,7 @@ Usage:
     python embed_documents.py --input paper.pdf --output out/ --overwrite
 
 Each output line is a JSON object:
-    {"source", "chunk_index", "text", "token_count", "embedding"}
+    {"source", "chunk_index", "page", "heading", "text", "token_count", "embedding"}
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import time
@@ -53,12 +54,15 @@ MAX_RETRIES = int(os.getenv("EMBED_MAX_RETRIES", "3"))
 # overrides it. Keep it equal to retrieval.py's, for the same reload reason as num_ctx.
 GPU_OPTIONS = {"num_gpu": int(os.environ["OLLAMA_NUM_GPU"])} if os.getenv("OLLAMA_NUM_GPU") else {}
 EMBED_OPTIONS = {"num_ctx": int(os.getenv("EMBED_NUM_CTX", str(2 * TOKEN_LIMIT))), **GPU_OPTIONS}
+HEADING_PATTERN = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
 
 
 @dataclass(frozen=True)
 class ChunkRecord:
     source: str
     chunk_index: int
+    page: int
+    heading: Optional[str]
     text: str
     token_count: int
     embedding: list[float]
@@ -99,6 +103,15 @@ def count_tokens(text: str, tokenizer) -> int:
     return len(tokenizer.encode(text, add_special_tokens=False))
 
 
+def extract_heading(text: str) -> Optional[str]:
+    headings = [
+        match.group(1).strip()
+        for line in text.splitlines()
+        if (match := HEADING_PATTERN.match(line))
+    ]
+    return headings[-1] if headings else None
+
+
 def embed_batch(texts: Sequence[str]) -> list[list[float]]:
     """Embed a batch of texts, retrying transient Ollama failures."""
     for attempt in range(1, MAX_RETRIES + 1):
@@ -123,27 +136,41 @@ def embed_batch(texts: Sequence[str]) -> list[list[float]]:
 
 
 def embed_document(pdf_path: Path, converter: PDF2MarkdownProcessor, tokenizer, token_limit: int = TOKEN_LIMIT) -> list[ChunkRecord]:
-    markdown = converter.convert(pdf_path)
-    log.info("Converted %s to %d characters of Markdown", pdf_path.name, len(markdown))
+    page_chunks = converter.convert(pdf_path, page_chunks=True)
+    if not isinstance(page_chunks, list):
+        raise RuntimeError(f"Expected page chunks for {pdf_path.name}")
+    log.info("Converted %s to %d page chunks", pdf_path.name, len(page_chunks))
 
-    chunks = [
-        chunk
-        for chunk in split_markdown_by_headings_with_token_limit(markdown, tokenizer, token_limit)
-        if chunk.strip()
-    ]
+    chunks: list[tuple[int, Optional[str], str]] = []
+    for page_chunk in page_chunks:
+        page = int(page_chunk["page"])
+        heading = page_chunk.get("heading")
+        page_markdown = str(page_chunk["text"])
+        page_parts = split_markdown_by_headings_with_token_limit(
+            page_markdown, tokenizer, token_limit
+        )
+        chunks.extend(
+            (page, extract_heading(text) or heading, text)
+            for text in page_parts
+            if text.strip()
+        )
+
     if not chunks:
         raise ValueError(f"No chunks produced for {pdf_path.name}")
     log.info("Split %s into %d chunks (limit %d tokens)", pdf_path.name, len(chunks), token_limit)
 
     records: list[ChunkRecord] = []
     for start in range(0, len(chunks), EMBED_BATCH_SIZE):
-        batch = chunks[start:start + EMBED_BATCH_SIZE]
+        batch_records = chunks[start:start + EMBED_BATCH_SIZE]
+        batch = [text for _, _, text in batch_records]
         vectors = embed_batch(batch)
-        for offset, (text, vector) in enumerate(zip(batch, vectors)):
+        for offset, ((page, heading, text), vector) in enumerate(zip(batch_records, vectors)):
             records.append(
                 ChunkRecord(
                     source=pdf_path.name,
                     chunk_index=start + offset,
+                    page=page,
+                    heading=heading,
                     text=text,
                     token_count=count_tokens(text, tokenizer),
                     embedding=vector,

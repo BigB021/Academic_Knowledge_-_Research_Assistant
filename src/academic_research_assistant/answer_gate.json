@@ -20,7 +20,7 @@
       "max": 0.5606
     },
     "rerank_fit_on": "borderline",
-    "k": 5,
+    "k": 3,
     "cases": "rag_eval_set.json",
     "reranker": true
   }

@@ -50,7 +50,7 @@ log = logging.getLogger("rag_pipeline")
 
 GENERATION_MODEL = os.getenv("GENERATION_MODEL", "gemma3:4b")
 GATE_CONFIG = Path(os.getenv("GATE_CONFIG", str(Path(__file__).resolve().parent / "answer_gate.json")))
-# 5 chunks of <= 512 Gemma tokens + the instructions fit in 4096. The judge in
+# 3 chunks of <= 512 Gemma tokens + the instructions fit in 4096. The judge in
 # evaluate_rag.py uses the same model and num_ctx, so switching between them never
 # reloads the model.
 GENERATION_OPTIONS = {
@@ -63,10 +63,24 @@ GENERATION_OPTIONS = {
 
 ABSTAIN_MESSAGE = "I cannot answer this from the provided documents."
 
-ANSWER_PROMPT = """You are a research assistant for a corpus of academic papers.
-Answer the question using ONLY the context below. Do not use outside knowledge.
-If the context does not contain the information needed to answer, reply with exactly this sentence and nothing else:
-{abstain}
+ANSWER_PROMPT = """You are a precise research assistant answering questions from a corpus of academic papers.
+
+## Rules
+1. Use ONLY the provided context. No outside knowledge; do not invent facts.
+2. Answer the question directly, addressing every part. For comparisons, cover each requested case and the meaningful differences.
+3. Keep important details: numbers, units, baselines, methods, and relationships between entities. Include the evidence behind each conclusion.
+4. Separate explicit statements from reasonable inferences. Make no unsupported causal claims.
+5. Cite every important factual claim with the context ID in square brackets, e.g. [1] or [2], placed right after the claim. Use multiple IDs when needed.
+6. Cite only IDs that appear at the start of context entries. Never invent IDs or cite document names, pages, or sections.
+7. Don't repeat claims or add generic introductions and conclusions.
+8. If the context lacks enough information, reply with exactly this and nothing else: {abstain}
+
+## Before responding, check
+- Every part of the question is answered, with relevant comparisons and numbers.
+- Every factual claim is supported and cited; no repeats or unsupported inferences.
+- If evidence is insufficient, return only the abstention.
+
+Return only the answer with inline citation IDs. No bibliography, no reasoning.
 
 ### CONTEXT:
 {context}
@@ -173,7 +187,75 @@ class AnswerGate:
 # ---------------------------------------------------------------------------
 
 def format_context(chunks: Sequence[RetrievedChunk]) -> str:
-    return "\n\n".join(f"[{rank}] {item.chunk.text}" for rank, item in enumerate(chunks, start=1))
+    formatted = []
+    for rank, item in enumerate(chunks, start=1):
+        location = [item.chunk.source]
+        if item.chunk.page is not None:
+            location.append(f"page {item.chunk.page}")
+        if item.chunk.heading:
+            location.append(f"section {item.chunk.heading}")
+        formatted.append(f"[{rank}] ({', '.join(location)})\n{item.chunk.text}")
+    return "\n\n".join(formatted)
+
+
+@dataclass(frozen=True)
+class Citation:
+    """A resolved citation suitable for rendering or PDF navigation in a UI."""
+
+    citation_id: int
+    document: str
+    page: Optional[int]
+    section: Optional[str]
+    chunk_index: int
+    passage: str
+
+    @property
+    def source_key(self) -> tuple[str, int]:
+        """Stable key for locating the source chunk in the indexed corpus."""
+        return self.document, self.chunk_index
+
+
+_CITATION_MARKER = re.compile(r"\[(\d+)\]")
+
+
+def resolve_citations(
+    answer: str, chunks: Sequence[RetrievedChunk]
+) -> tuple[str, list[Citation]]:
+    """Resolve internal model markers and remove them from display text.
+
+    The model only sees ranked, temporary IDs. The returned citation objects use
+    retrieved metadata and the exact passage, leaving a future UI free to map
+    ``document`` and ``page`` to a local PDF viewer.
+    """
+    cited_ids = [int(match.group(1)) for match in _CITATION_MARKER.finditer(answer)]
+    available = {rank: item for rank, item in enumerate(chunks, start=1)}
+    invalid_ids = sorted(set(cited_ids) - set(available))
+    if invalid_ids:
+        log.warning("Model returned citation IDs not present in context: %s", invalid_ids)
+
+    citations: list[Citation] = []
+    seen: set[int] = set()
+    for citation_id in cited_ids:
+        item = available.get(citation_id)
+        if item is None or citation_id in seen:
+            continue
+        seen.add(citation_id)
+        citations.append(
+            Citation(
+                citation_id=citation_id,
+                document=item.chunk.source,
+                page=item.chunk.page,
+                section=item.chunk.heading,
+                chunk_index=item.chunk.chunk_index,
+                passage=item.chunk.text,
+            )
+        )
+
+    display_answer = _CITATION_MARKER.sub("", answer)
+    display_answer = re.sub(r"[ \t]{2,}", " ", display_answer)
+    display_answer = re.sub(r" +([,.;:])", r"\1", display_answer)
+    display_answer = re.sub(r"\n[ \t]*\n[ \t]*\n+", "\n\n", display_answer).strip()
+    return display_answer, citations
 
 
 def generate_answer(question: str, chunks: Sequence[RetrievedChunk], model: str = GENERATION_MODEL) -> str:
@@ -196,12 +278,14 @@ class RAGAnswer:
     retrieval: RetrievalResult
     decision: GateDecision
     answer: str
+    citations: list[Citation]
     abstained: bool       # the gate refused, or the LLM said the context is insufficient
     generated: bool       # False when the gate abstained before calling the LLM
     latency_s: float
 
 
-def answer_question(question: str, retriever: Retriever, gate: AnswerGate, k: int = 5,
+
+def answer_question(question: str, retriever: Retriever, gate: AnswerGate, k: int = 3,
                     retrieval: Optional[RetrievalResult] = None) -> RAGAnswer:
     """Retrieve (unless a retrieval result is passed in), gate, then generate."""
     start = time.perf_counter()
@@ -210,7 +294,9 @@ def answer_question(question: str, retriever: Retriever, gate: AnswerGate, k: in
     if not decision.answer:
         log.info("Abstaining (%s, similarity %.3f)", decision.reason, decision.top_similarity)
         return RAGAnswer(question, retrieval, decision, ABSTAIN_MESSAGE, abstained=True, generated=False,
-                         latency_s=time.perf_counter() - start)
-    answer = generate_answer(question, decision.chunks)
-    return RAGAnswer(question, retrieval, decision, answer, abstained=is_abstention(answer), generated=True,
+                         citations=[], latency_s=time.perf_counter() - start)
+    raw_answer = generate_answer(question, decision.chunks)
+    answer, citations = resolve_citations(raw_answer, decision.chunks)
+    return RAGAnswer(question, retrieval, decision, answer, citations,
+                     abstained=is_abstention(answer), generated=True,
                      latency_s=time.perf_counter() - start)

@@ -325,7 +325,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--rerank", action="store_true", help="rerank borderline questions (Qwen3-Reranker)")
     parser.add_argument("--generate", action="store_true", help="generate and judge answers (slow)")
     parser.add_argument("--margin", type=float, default=0.02, help="widening of the borderline band")
-    parser.add_argument("-k", type=int, default=5)
+    parser.add_argument("-k", type=int, default=3)
     parser.add_argument("--out", type=Path, help="per-question results (JSON); default: benchmarks/logs/")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)

@@ -15,7 +15,7 @@ Library usage
     index = VectorIndex()
     index.add_jsonl(Path("documents/embeddings/paper.jsonl"))
 
-    result = BaselineRetriever(index).retrieve("What does X do?", k=5)
+    result = BaselineRetriever(index).retrieve("What does X do?", k=3)
     for item in result.chunks:
         print(item.chunk.chunk_index, item.distance, item.chunk.text[:80])
 
@@ -93,6 +93,8 @@ class Chunk:
     source: str
     chunk_index: int
     text: str
+    page: Optional[int] = None
+    heading: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -135,7 +137,7 @@ class Retriever(Protocol):
     name: str
     models: tuple[str, ...]  # Ollama models this strategy keeps loaded
 
-    def retrieve(self, question: str, k: int = 5) -> RetrievalResult: ...
+    def retrieve(self, question: str, k: int = 3) -> RetrievalResult: ...
 
 
 # ---------------------------------------------------------------------------
@@ -197,10 +199,21 @@ class VectorIndex:
     def upsert_records(self, records: Sequence[dict], batch_size: int = 256) -> int:
         for start in range(0, len(records), batch_size):
             batch = records[start:start + batch_size]
+            metadatas = []
+            for record in batch:
+                metadata = {
+                    "source": record["source"],
+                    "chunk_index": record["chunk_index"],
+                }
+                if record.get("page") is not None:
+                    metadata["page"] = record["page"]
+                if record.get("heading"):
+                    metadata["heading"] = record["heading"]
+                metadatas.append(metadata)
             self._collection.upsert(
                 ids=[f"{r['source']}-{r['chunk_index']}" for r in batch],
                 documents=[r["text"] for r in batch],
-                metadatas=[{"source": r["source"], "chunk_index": r["chunk_index"]} for r in batch],
+                metadatas=metadatas,
                 embeddings=[r["embedding"] for r in batch],
             )
         return len(records)
@@ -216,7 +229,13 @@ class VectorIndex:
         )
         return [
             RetrievedChunk(
-                chunk=Chunk(source=meta["source"], chunk_index=meta["chunk_index"], text=doc),
+                chunk=Chunk(
+                    source=meta["source"],
+                    chunk_index=meta["chunk_index"],
+                    text=doc,
+                    page=meta.get("page"),
+                    heading=meta.get("heading"),
+                ),
                 distance=dist,
             )
             for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0], res["distances"][0])
@@ -236,7 +255,7 @@ class BaselineRetriever:
     def __init__(self, index: VectorIndex):
         self.index = index
 
-    def retrieve(self, question: str, k: int = 5) -> RetrievalResult:
+    def retrieve(self, question: str, k: int = 3) -> RetrievalResult:
         start = time.perf_counter()
         chunks = self.index.search(embed_query(question), k)
         return RetrievalResult(
@@ -294,7 +313,7 @@ class RewriteRetriever:
     def __init__(self, index: VectorIndex):
         self.index = index
 
-    def retrieve(self, question: str, k: int = 5) -> RetrievalResult:
+    def retrieve(self, question: str, k: int = 3) -> RetrievalResult:
         start = time.perf_counter()
         rewritten = rewrite_query(question)
         chunks = self.index.search(embed_query(rewritten), k)
@@ -444,7 +463,7 @@ class RerankedBaselineRetriever:
         self.reranker = reranker
         self.candidates = candidates
 
-    def retrieve(self, question: str, k: int = 5) -> RetrievalResult:
+    def retrieve(self, question: str, k: int = 3) -> RetrievalResult:
         if k > self.candidates:
             raise ValueError(f"k ({k}) cannot exceed candidates ({self.candidates})")
         start = time.perf_counter()
@@ -485,7 +504,7 @@ class TestCase:
         return index in self.gold and (self.source is None or source == self.source)
 
 
-def score_retrieval(retrieved: Sequence[tuple[str, int]], case: TestCase, k: int = 5) -> dict[str, float]:
+def score_retrieval(retrieved: Sequence[tuple[str, int]], case: TestCase, k: int = 3) -> dict[str, float]:
     """Hit@1, Hit@k, Recall@k and MRR for one answerable case (retrieved is in rank order)."""
     retrieved = list(retrieved)[:k]
     hits = [case.is_gold(key) for key in retrieved]
@@ -498,7 +517,7 @@ def score_retrieval(retrieved: Sequence[tuple[str, int]], case: TestCase, k: int
     }
 
 
-def evaluate(retriever: Retriever, cases: Sequence[TestCase], k: int = 5) -> list[dict]:
+def evaluate(retriever: Retriever, cases: Sequence[TestCase], k: int = 3) -> list[dict]:
     rows = []
     for case in cases:
         if not case.answerable:
@@ -547,7 +566,8 @@ def _print_result(result: RetrievalResult) -> None:
         print(f"   {item.chunk.text[:150]!r}")
 
 
-def _print_eval(rows: list[dict], k: int = 5) -> None:
+
+def _print_eval(rows: list[dict], k: int = 3) -> None:
     import statistics
 
     by_strategy: dict[str, list[dict]] = {}
@@ -570,7 +590,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--ingest", type=Path, help="a JSONL file or a directory of JSONL files")
     parser.add_argument("--ask", help="question to run through every strategy")
     parser.add_argument("--eval", type=Path, help="JSON file of test cases to score every strategy")
-    parser.add_argument("-k", type=int, default=5, help="chunks returned per strategy")
+    parser.add_argument("-k", type=int, default=3, help="chunks returned per strategy")
     parser.add_argument("--candidates", type=int, default=15,
                         help=f"baseline candidates re-scored by the reranker ({MIN_CANDIDATES}-{MAX_CANDIDATES})")
     parser.add_argument("-v", "--verbose", action="store_true")
