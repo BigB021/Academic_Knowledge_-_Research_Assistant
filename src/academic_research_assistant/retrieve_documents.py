@@ -1,12 +1,13 @@
 """Retrieval strategies for the RAG index.
 
-Three independent strategies, all returning the same RetrievalResult:
+Four independent strategies, all returning the same RetrievalResult:
 
     BaselineRetriever           embed the raw question, return the top-k chunks
     RewriteRetriever            LLM rewrites the question into one search query,
                                 then return the top-k chunks for that query
     RerankedBaselineRetriever   baseline top-N candidates re-scored by
                                 Qwen3-Reranker (Hugging Face, in-process), return the top-k
+    SparseRetriever             BM25 sparse retrieval, return the top-k chunks
 
 Library usage
     from retrieval_strategies import VectorIndex, BaselineRetriever, RewriteRetriever
@@ -29,9 +30,14 @@ CLI usage
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
+import math
 import os
+import pickle
+import re
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,9 +63,9 @@ MAX_RETRIES = int(os.getenv("OLLAMA_MAX_RETRIES", "3"))
 MIN_CANDIDATES = 10
 MAX_CANDIDATES = 20
 
-# Context sizes are set per model: Ollama's default 4096 reserves KV-cache RAM these
-# prompts never use. Keep each model's num_ctx constant (and EMBED_NUM_CTX equal to the
-# one in embed_documents.py): a request with a different num_ctx forces a model reload.
+# Context sizes are set per model: Ollama's default 4096 reserves KV-cache RAM thes prompts never use. 
+# Keep each model's num_ctx constant (and EMBED_NUM_CTX equal to the one in embed_documents.py): 
+# a request with a different num_ctx forces a model reload.
 #   embedder  chunks are <= 512 Gemma tokens          -> 1024 (2x tokenizer headroom)
 #   rewriter  ~100-token prompt + a short JSON answer -> 512
 # Ollama picks GPU or CPU on its own (CUDA, ROCm or Metal when available). OLLAMA_NUM_GPU
@@ -102,6 +108,7 @@ class RetrievedChunk:
     chunk: Chunk
     distance: Optional[float]               # vector distance (lower is closer)
     rerank_score: Optional[float] = None    # P(yes) from the reranker (higher is better)
+    channel_ranks: Optional[dict[str, int | None]] = None
 
     @property
     def similarity(self) -> Optional[float]:
@@ -117,6 +124,7 @@ class RetrievalResult:
     search_query: str                       # the text that was actually embedded
     chunks: list[RetrievedChunk]
     latency_s: float
+    channel_ranks: Optional[dict[tuple[str, int], dict[str, int | None]]] = None
 
     @property
     def chunk_indices(self) -> list[int]:
@@ -177,7 +185,7 @@ def unload_models(*models: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Vector index (ChromaDB)
+# Vector index (ChromaDB) Dense Retrieval
 # ---------------------------------------------------------------------------
 
 class VectorIndex:
@@ -189,6 +197,27 @@ class VectorIndex:
 
     def __len__(self) -> int:
         return self._collection.count()
+
+    @property
+    def keys(self) -> set[tuple[str, int]]:
+        result = self._collection.get(include=["metadatas"])
+        return {
+            (meta["source"], int(meta["chunk_index"]))
+            for meta in result["metadatas"]
+        }
+
+    def records(self) -> list[dict]:
+        result = self._collection.get(include=["documents", "metadatas"])
+        return [
+            {
+                "source": meta["source"],
+                "chunk_index": meta["chunk_index"],
+                "text": text,
+                "page": meta.get("page"),
+                "heading": meta.get("heading"),
+            }
+            for text, meta in zip(result["documents"], result["metadatas"])
+        ]
 
     def add_jsonl(self, path: Path) -> int:
         """Load records written by embed_documents.py. Re-adding is idempotent."""
@@ -240,6 +269,166 @@ class VectorIndex:
             )
             for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0], res["distances"][0])
         ]
+
+
+# ---------------------------------------------------------------------------
+# Sparse BM25 retrieval
+# ---------------------------------------------------------------------------
+
+SPARSE_STOPWORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
+    "in", "is", "it", "of", "on", "or", "that", "the", "this", "to",
+    "was", "were", "what", "when", "where", "which", "with",
+})
+_TOKEN_PATTERN = re.compile(r"[^\W_]+(?:[-.][^\W_]+)*", re.UNICODE)
+
+
+def tokenize(text: str) -> list[str]:
+    """Tokenize technical text while preserving intra-token hyphens and dots."""
+    return [
+        token for token in _TOKEN_PATTERN.findall(text.lower())
+        if token not in SPARSE_STOPWORDS
+    ]
+
+
+class SparseIndex:
+    """Persistent, dependency-free BM25 index parallel to a VectorIndex."""
+
+    def __init__(self, path: str | Path = CHROMA_PATH):
+        self.path = Path(path) / "bm25.pkl"
+        self._records: dict[tuple[str, int], Chunk] = {}
+        self._tokenized: dict[tuple[str, int], list[str]] = {}
+        self._document_frequency: dict[str, int] = {}
+        self._average_length = 0.0
+        self._load()
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    @property
+    def keys(self) -> set[tuple[str, int]]:
+        return set(self._records)
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        with self.path.open("rb") as fh:
+            state = pickle.load(fh)
+        self._records = {
+            tuple(key): Chunk(**value) for key, value in state["records"].items()
+        }
+        self._tokenized = {
+            tuple(key): list(tokens) for key, tokens in state["tokenized"].items()
+        }
+        self._document_frequency = state["document_frequency"]
+        self._average_length = state["average_length"]
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        state = {
+            "records": {
+                key: {
+                    "source": chunk.source,
+                    "chunk_index": chunk.chunk_index,
+                    "text": chunk.text,
+                    "page": chunk.page,
+                    "heading": chunk.heading,
+                }
+                for key, chunk in self._records.items()
+            },
+            "tokenized": self._tokenized,
+            "document_frequency": self._document_frequency,
+            "average_length": self._average_length,
+        }
+        fd, temporary = tempfile.mkstemp(dir=self.path.parent, prefix=".bm25.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                pickle.dump(state, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(temporary, self.path)
+        except BaseException:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary)
+            raise
+
+    def upsert_records(self, records: Sequence[dict]) -> int:
+        for record in records:
+            key = (record["source"], int(record["chunk_index"]))
+            chunk = Chunk(
+                source=key[0],
+                chunk_index=key[1],
+                text=record["text"],
+                page=record.get("page"),
+                heading=record.get("heading"),
+            )
+            self._records[key] = chunk
+            self._tokenized[key] = tokenize(chunk.text)
+        self._rebuild_statistics()
+        self._save()
+        return len(records)
+
+    def replace_records(self, records: Sequence[dict]) -> int:
+        self._records.clear()
+        self._tokenized.clear()
+        return self.upsert_records(records)
+
+    def _rebuild_statistics(self) -> None:
+        self._document_frequency = {
+            token: sum(token in tokens for tokens in self._tokenized.values())
+            for tokens in self._tokenized.values()
+            for token in set(tokens)
+        }
+        self._average_length = (
+            sum(map(len, self._tokenized.values())) / len(self._tokenized)
+            if self._tokenized else 0.0
+        )
+
+    def add_jsonl(self, path: Path) -> int:
+        with path.open(encoding="utf-8") as fh:
+            records = [json.loads(line) for line in fh if line.strip()]
+        return self.upsert_records(records)
+
+    def search(self, query_text: str, n: int = 10) -> list[tuple[tuple[str, int], float]]:
+        query_tokens = tokenize(query_text)
+        if not query_tokens or not self._records or not self._average_length:
+            return []
+        document_count = len(self._tokenized)
+        scores: list[tuple[tuple[str, int], float]] = []
+        k1, b = 1.5, 0.75
+        for key, tokens in self._tokenized.items():
+            length = len(tokens)
+            frequencies = {token: tokens.count(token) for token in set(query_tokens)}
+            score = 0.0
+            for token, frequency in frequencies.items():
+                if not frequency:
+                    continue
+                df = self._document_frequency[token]
+                idf = math.log(1 + (document_count - df + 0.5) / (df + 0.5))
+                score += idf * frequency * (k1 + 1) / (
+                    frequency + k1 * (1 - b + b * length / self._average_length)
+                )
+            if score > 0:
+                scores.append((key, score))
+        scores.sort(key=lambda item: (-item[1], item[0]))
+        return scores[:n]
+
+    def get(self, key: tuple[str, int]) -> Optional[Chunk]:
+        return self._records.get(key)
+
+
+def reciprocal_rank_fusion(
+    rankings: Sequence[Sequence[tuple[str, int]]], k: int = 60
+) -> list[tuple[tuple[str, int], float]]:
+    """Fuse ranked key lists with deterministic first-ranking tie breaking."""
+    scores: dict[tuple[str, int], float] = {}
+    first_seen: dict[tuple[str, int], int] = {}
+    order = 0
+    for ranking in rankings:
+        for rank, key in enumerate(ranking, start=1):
+            if key not in first_seen:
+                first_seen[key] = order
+                order += 1
+            scores[key] = scores.get(key, 0.0) + 1 / (k + rank)
+    return sorted(scores.items(), key=lambda item: (-item[1], first_seen[item[0]]))
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +672,120 @@ class RerankedBaselineRetriever:
         )
 
 
+def _hybrid_candidates(
+    index: VectorIndex,
+    sparse: SparseIndex,
+    question: str,
+    candidates: int,
+    rrf_k: int,
+) -> tuple[list[tuple[tuple[str, int], float]], dict[tuple[str, int], RetrievedChunk], dict[tuple[str, int], dict[str, int | None]]]:
+    dense = index.search(embed_query(question), candidates)
+    sparse_results = sparse.search(question, candidates)
+    dense_by_key = {(
+        item.chunk.source, item.chunk.chunk_index
+    ): item for item in dense}
+    sparse_by_key = {key: sparse.get(key) for key, _ in sparse_results}
+    dense_keys = list(dense_by_key)
+    sparse_keys = [key for key, _ in sparse_results]
+    fused = reciprocal_rank_fusion((dense_keys, sparse_keys), k=rrf_k)
+    channel_ranks = {
+        key: {
+            "dense": dense_keys.index(key) + 1 if key in dense_by_key else None,
+            "sparse": sparse_keys.index(key) + 1 if key in sparse_keys else None,
+        }
+        for key, _ in fused
+    }
+    chunks: dict[tuple[str, int], RetrievedChunk] = {}
+    for key, _ in fused:
+        dense_item = dense_by_key.get(key)
+        chunk = dense_item.chunk if dense_item else sparse_by_key.get(key)
+        if chunk is None:
+            continue
+        chunks[key] = RetrievedChunk(
+            chunk=chunk,
+            distance=dense_item.distance if dense_item else None,
+            channel_ranks=channel_ranks[key],
+        )
+    return fused, chunks, channel_ranks
+
+
+class HybridRetriever:
+    """Fuse dense Chroma candidates and sparse BM25 candidates with RRF."""
+
+    name = "hybrid"
+    models = (EMBED_MODEL,)
+
+    def __init__(self, index: VectorIndex, sparse: SparseIndex, candidates: int = 20, rrf_k: int = 60):
+        self.index = index
+        self.sparse = sparse
+        self.candidates = candidates
+        self.rrf_k = rrf_k
+
+    def retrieve(self, question: str, k: int = 3) -> RetrievalResult:
+        if k > self.candidates:
+            raise ValueError(f"k ({k}) cannot exceed candidates ({self.candidates})")
+        start = time.perf_counter()
+        fused, chunks_by_key, channel_ranks = _hybrid_candidates(
+            self.index, self.sparse, question, self.candidates, self.rrf_k
+        )
+        chunks = [chunks_by_key[key] for key, _ in fused[:k] if key in chunks_by_key]
+        return RetrievalResult(
+            strategy=self.name,
+            question=question,
+            search_query=question,
+            chunks=chunks,
+            latency_s=time.perf_counter() - start,
+            channel_ranks={key: channel_ranks[key] for key, _ in fused[:k]},
+        )
+
+
+class HybridRerankedRetriever:
+    """Fuse dense and sparse candidates, then score the fused pool."""
+
+    name = "hybrid+rerank"
+    models = (EMBED_MODEL,)
+
+    def __init__(
+        self, index: VectorIndex, sparse: SparseIndex, reranker: Reranker,
+        candidates: int = 15, rrf_k: int = 60,
+    ):
+        if not MIN_CANDIDATES <= candidates <= MAX_CANDIDATES:
+            raise ValueError(f"candidates must be between {MIN_CANDIDATES} and {MAX_CANDIDATES}")
+        self.index = index
+        self.sparse = sparse
+        self.reranker = reranker
+        self.candidates = candidates
+        self.rrf_k = rrf_k
+
+    def retrieve(self, question: str, k: int = 3) -> RetrievalResult:
+        if k > self.candidates:
+            raise ValueError(f"k ({k}) cannot exceed candidates ({self.candidates})")
+        start = time.perf_counter()
+        fused, chunks_by_key, channel_ranks = _hybrid_candidates(
+            self.index, self.sparse, question, self.candidates, self.rrf_k
+        )
+        pool = [chunks_by_key[key] for key, _ in fused[:self.candidates] if key in chunks_by_key]
+        scores = self.reranker.score(question, [item.chunk.text for item in pool])
+        ranked = sorted(zip(pool, scores), key=lambda pair: pair[1], reverse=True)[:k]
+        chunks = [
+            RetrievedChunk(
+                chunk=item.chunk,
+                distance=item.distance,
+                rerank_score=score,
+                channel_ranks=item.channel_ranks,
+            )
+            for item, score in ranked
+        ]
+        return RetrievalResult(
+            strategy=self.name,
+            question=question,
+            search_query=question,
+            chunks=chunks,
+            latency_s=time.perf_counter() - start,
+            channel_ranks=channel_ranks,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
@@ -562,6 +865,13 @@ def _print_result(result: RetrievalResult) -> None:
             scores.append(f"similarity={item.similarity:.4f}")
         if item.rerank_score is not None:
             scores.append(f"rerank={item.rerank_score:.4f}")
+        if item.channel_ranks:
+            scores.append(
+                "ranks=" + ",".join(
+                    f"{channel}:{rank if rank is not None else '-'}"
+                    for channel, rank in item.channel_ranks.items()
+                )
+            )
         print(f"#{rank} chunk {item.chunk.chunk_index} ({', '.join(scores)})")
         print(f"   {item.chunk.text[:150]!r}")
 
@@ -593,6 +903,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("-k", type=int, default=3, help="chunks returned per strategy")
     parser.add_argument("--candidates", type=int, default=15,
                         help=f"baseline candidates re-scored by the reranker ({MIN_CANDIDATES}-{MAX_CANDIDATES})")
+    parser.add_argument(
+        "--strategies", default="all",
+        help="comma-separated strategy names, or 'all' (default)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -600,19 +914,38 @@ def main(argv: Optional[list[str]] = None) -> int:
                         format="%(levelname)s: %(message)s")
 
     index = VectorIndex()
+    sparse = SparseIndex()
     if args.ingest:
         files = [args.ingest] if args.ingest.is_file() else sorted(args.ingest.glob("*.jsonl"))
         for path in files:
             print(f"Indexed {index.add_jsonl(path)} chunk(s) from {path.name}")
+            sparse.add_jsonl(path)
     if len(index) == 0:
         print("error: the index is empty; pass --ingest with embedded JSONL files")
         return 1
+    if sparse.keys != index.keys:
+        log.warning("Sparse and dense indexes differ; rebuilding sparse index from Chroma")
+        sparse.replace_records(index.records())
+    if sparse.keys != index.keys:
+        raise RuntimeError("Sparse and dense indexes are out of sync after ingestion")
 
+    reranker = Reranker()
     strategies: list[Retriever] = [
         BaselineRetriever(index),
         RewriteRetriever(index),
-        RerankedBaselineRetriever(index, Reranker(), candidates=args.candidates),
+        RerankedBaselineRetriever(index, reranker, candidates=args.candidates),
+        HybridRetriever(index, sparse, candidates=args.candidates),
+        HybridRerankedRetriever(index, sparse, reranker, candidates=args.candidates),
     ]
+    selected = [name.strip() for name in args.strategies.split(",") if name.strip()]
+    available = {strategy.name: strategy for strategy in strategies}
+    unknown = set(selected) - set(available) if selected != ["all"] else set()
+    if unknown:
+        parser.error(f"unknown strategy: {', '.join(sorted(unknown))}")
+    if selected == ["all"]:
+        strategies = strategies
+    else:
+        strategies = [available[name] for name in selected]
 
     cases = load_cases(args.eval) if args.eval else []
     rows: list[dict] = []
@@ -626,6 +959,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         still_needed = {model for later in strategies[position + 1:] for model in later.models}
         unload_models(*(model for model in strategy.models if model not in still_needed))
 
+    reranker.close()
     if rows:
         _print_eval(rows, args.k)
     return 0

@@ -18,8 +18,11 @@ Library usage
     from academic_research_assistant.rag_pipeline import AnswerGate, answer_question
 
     gate = AnswerGate.from_config(reranker=Reranker())   # reranker optional
-    result = answer_question("What does X do?", BaselineRetriever(index), gate)
+    retriever = build_retriever(VectorIndex(), SparseIndex(), reranker=gate.reranker)
+    result = answer_question("What does X do?", retriever, gate)
     print(result.decision.reason, result.answer)
+
+Omit ``SparseIndex()`` from ``build_retriever`` to use dense retrieval only.
 """
 
 from __future__ import annotations
@@ -38,10 +41,16 @@ from dotenv import load_dotenv
 
 from academic_research_assistant.retrieve_documents import (
     GPU_OPTIONS,
+    BaselineRetriever,
+    HybridRerankedRetriever,
+    HybridRetriever,
     Reranker,
+    RerankedBaselineRetriever,
     RetrievalResult,
     RetrievedChunk,
     Retriever,
+    SparseIndex,
+    VectorIndex,
     _retry,
 )
 
@@ -180,6 +189,38 @@ class AnswerGate:
         best = reranked[0].rerank_score if reranked else 0.0
         ok = best >= t.rerank_min
         return GateDecision(ok, "rerank-accept" if ok else "rerank-reject", top, best, reranked)
+
+
+# ---------------------------------------------------------------------------
+# Retriever construction
+# ---------------------------------------------------------------------------
+
+def build_retriever(
+    index: VectorIndex,
+    sparse_index: Optional[SparseIndex] = None,
+    reranker: Optional[Reranker] = None,
+    candidates: int = 20,
+) -> Retriever:
+    """Build the retriever used by the RAG pipeline.
+
+    Passing a sparse index enables BM25+dense reciprocal-rank fusion. The sparse
+    index is rebuilt from Chroma when its keys differ, so ingestion cannot leave
+    the answer pipeline serving stale or incomplete sparse results.
+    """
+    if sparse_index is None:
+        if reranker is not None:
+            return RerankedBaselineRetriever(index, reranker, candidates=candidates)
+        return BaselineRetriever(index)
+
+    if sparse_index.keys != index.keys:
+        log.warning("Sparse and dense indexes differ; rebuilding sparse index from Chroma")
+        sparse_index.replace_records(index.records())
+    if sparse_index.keys != index.keys:
+        raise RuntimeError("Sparse and dense indexes are out of sync after rebuilding")
+
+    if reranker is None:
+        return HybridRetriever(index, sparse_index, candidates=candidates)
+    return HybridRerankedRetriever(index, sparse_index, reranker, candidates=candidates)
 
 
 # ---------------------------------------------------------------------------

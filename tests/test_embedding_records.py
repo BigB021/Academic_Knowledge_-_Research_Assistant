@@ -30,6 +30,17 @@ class FakeConverter:
         ]
 
 
+class FakeOfficeConverter:
+    def convert(self, document_path, *, units):
+        self.called_with_units = units
+        return [
+            {
+                "text": "## Sheet: Data\n\n| Name |\n| --- |\n| value |",
+                "metadata": {"unit_index": 3, "heading": "Data"},
+            }
+        ]
+
+
 class EmbeddingRecordTests(unittest.TestCase):
     @patch.object(embed_documents, "embed_batch", side_effect=lambda texts: [[float(i)] for i, _ in enumerate(texts)])
     @patch.object(
@@ -49,6 +60,23 @@ class EmbeddingRecordTests(unittest.TestCase):
         self.assertEqual(records[1].heading, "Results")
         self.assertEqual(records[0].chunk_index, 0)
         self.assertEqual(records[1].chunk_index, 1)
+
+    @patch.object(embed_documents, "embed_batch", return_value=[[1.0, 0.0]])
+    @patch.object(
+        embed_documents,
+        "split_markdown_by_headings_with_token_limit",
+        side_effect=lambda text, tokenizer, token_limit: [text],
+    )
+    def test_office_units_become_indexable_metadata(self, _split, _embed):
+        converter = FakeOfficeConverter()
+        records = embed_documents.embed_document(
+            Path("workbook.xlsx"), converter, FakeTokenizer(), token_limit=32
+        )
+
+        self.assertTrue(converter.called_with_units)
+        self.assertEqual(records[0].source, "workbook.xlsx")
+        self.assertEqual(records[0].page, 3)
+        self.assertEqual(records[0].heading, "Data")
 
 
 if __name__ == "__main__":
